@@ -14,22 +14,35 @@ static DROP_TASK_SENDER: OnceLock<tokio::sync::mpsc::UnboundedSender<BoxFuture<'
 // We can consider creating `AsyncDrop` trait + `AsyncDropGuard<T: AsyncDrop>` wrapper to make it more ergonomic.
 // However, we have a only couple of places where we need this functionality.
 pub(crate) fn async_drop(future: impl std::future::Future<Output = ()> + Send + 'static) {
-    let handle = tokio::runtime::Handle::current();
-    match handle.runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::CurrentThread => {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            dropper_task_sender()
-                .send(Box::pin(async move {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::CurrentThread => {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    dropper_task_sender()
+                        .send(Box::pin(async move {
+                            future.await;
+                            let _ = tx.send(());
+                        }))
+                        .expect("drop-worker must be running: failed to send drop task");
+                    let _ = rx.recv();
+                }
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(move || handle.block_on(future))
+                }
+                _ => unreachable!("unsupported runtime flavor"),
+            }
+        }
+        Err(e) => {
+            log::warn!("Error getting current runtime handle: {:?}", e);
+            // Fallback behavior: Create a new runtime in a separate thread
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+                rt.block_on(async {
                     future.await;
-                    let _ = tx.send(());
-                }))
-                .expect("drop-worker must be running: failed to send drop task");
-            let _ = rx.recv();
+                });
+            });
         }
-        tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(move || handle.block_on(future))
-        }
-        _ => unreachable!("unsupported runtime flavor"),
     }
 }
 
